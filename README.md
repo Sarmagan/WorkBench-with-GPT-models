@@ -71,10 +71,12 @@ To add a new model, just add its name to `AVAILABLE_LLMS` in `src/evals/utils.py
 Results are saved to `data/results/<domain>/` as timestamped CSV files.  
 Metrics are printed to stdout at the end of each run.
 
+The gpt-5-nano results are as follows:
+
 | | Analytics | Calendar | CRM | Email | Project Management | Multi Domain |
 |---|---|---|---|---|---|---|
 | Number of tasks | 120 | 110 | 80 | 90 | 80 | 210 |
-| Accuracy  |  | 86.36% |  |  |  |  |
+| Accuracy  |  | 86.36% |  | 82.22% |  |  |
 
 ---
 
