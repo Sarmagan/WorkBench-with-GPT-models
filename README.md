@@ -76,7 +76,7 @@ The gpt-5-nano results are as follows:
 | | Analytics | Calendar | CRM | Email | Project Management | Multi Domain |
 |---|---|---|---|---|---|---|
 | Number of tasks | 120 | 110 | 80 | 90 | 80 | 210 |
-| Accuracy  |  | 86.36% |  | 82.22% |  |  |
+| Accuracy  | 45.83% | 86.36% | 68.75% | 82.22% | 71.25% | 45.24% |
 
 ---
 
