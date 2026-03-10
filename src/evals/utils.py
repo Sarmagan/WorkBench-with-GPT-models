@@ -557,3 +557,222 @@ def generate_results(queries_path, model_name, tool_selection="all", num_retrys=
     save_path = os.path.join(save_dir, model_name + "_" + tool_selection + "_" + current_datetime + ".csv")
     results.to_csv(save_path, index=False, quoting=csv.QUOTE_ALL)
     return results
+
+# ---------------------------------------------------------------------------
+# Tool planner — selects relevant tools per query, then checks dependencies
+# ---------------------------------------------------------------------------
+
+_PLANNER_SYSTEM_PROMPT = (
+    "Carefully examine the given workplace task, and return a list of names of the most "
+    "appropriate and relevant tools. Ensure that returned tools only do what the given task "
+    "requires and do nothing extra. To be able to use some tools, you need to use prerequisite "
+    "tools. Therefore, pay attention to the parameters each tool accepts. "
+    "Return your answer as a JSON array of tool name strings. Return nothing else."
+)
+
+_PLANNER_USER_TEMPLATE = (
+    "You are going to select tools from the following tools:\n{tools_json}\n\nTask: {task}"
+)
+
+
+def _load_dependency_map(dependencies_path: str = "data/tool_dependencies.json") -> dict[str, list[str]]:
+    """Load tool_dependencies.json and return a {tool: [depends_on, ...]} map."""
+    if not os.path.exists(dependencies_path):
+        print(f"WARNING: '{dependencies_path}' not found. Run analyze_tool_dependencies.py first. Skipping dependency check.")
+        return {}
+    with open(dependencies_path) as f:
+        data = json.load(f)
+    dep_map: dict[str, list[str]] = {}
+    for d in data.get("dependencies", []):
+        dep_map.setdefault(d["tool"], []).append(d["depends_on"])
+    return dep_map
+
+
+def _resolve_missing_dependencies(selected: list[str], dep_map: dict[str, list[str]]) -> list[str]:
+    """Recursively add any prerequisite tools missing from the selected list."""
+    result = list(selected)
+    queue = list(selected)
+    while queue:
+        tool = queue.pop(0)
+        for prereq in dep_map.get(tool, []):
+            if prereq not in result:
+                result.append(prereq)
+                queue.append(prereq)
+    return result
+
+
+def _plan_tools_for_query(
+    client: OpenAI,
+    planner_model: str,
+    query: str,
+    dep_map: dict[str, list[str]],
+) -> list:
+    """
+    Ask the planner LLM to select tools for a query, validate against the
+    dependency map, and return the resolved list of tool functions.
+    """
+    import re
+
+    all_tool_fns = {fn.openai_schema["function"]["name"]: fn for fn in _TOOL_REGISTRY.values()}
+    tools_summary = [
+        {"name": name, "description": fn.openai_schema["function"]["description"]}
+        for name, fn in all_tool_fns.items()
+    ]
+
+    user_prompt = _PLANNER_USER_TEMPLATE.format(
+        tools_json=json.dumps(tools_summary, indent=2),
+        task=query,
+    )
+
+    response = client.chat.completions.create(
+        model=planner_model,
+        messages=[
+            {"role": "system", "content": _PLANNER_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+    )
+
+    raw = response.choices[0].message.content.strip()
+
+    # Parse the JSON array from the response
+    valid_names = set(all_tool_fns.keys())
+    selected_names = []
+    json_match = re.search(r"\[[\s\S]*?\]", raw)
+    if json_match:
+        try:
+            candidates = json.loads(json_match.group(0))
+            if isinstance(candidates, list):
+                selected_names = [c for c in candidates if c in valid_names]
+        except json.JSONDecodeError:
+            pass
+    if not selected_names:
+        # Fallback: scan for known tool names in the text
+        selected_names = [name for name in valid_names if name in raw]
+
+    # Add missing prerequisites
+    resolved_names = _resolve_missing_dependencies(selected_names, dep_map)
+
+    added = [n for n in resolved_names if n not in selected_names]
+    if added:
+        print(f"  [planner] added missing dependencies: {added}")
+
+    print(f"  [planner] tools selected: {resolved_names}")
+    return [all_tool_fns[name] for name in resolved_names if name in all_tool_fns]
+
+
+def generate_results_with_planned_tools(
+    queries_path: str,
+    model_name: str,
+    planner_model: str = "gpt-5-nano",
+    dependencies_path: str = "data/tool_dependencies.json",
+    num_retrys: int = 0,
+):
+    """
+    Like generate_results(), but selects tools per query using the planner LLM
+    instead of passing the full toolkit. Requires tool_dependencies.json to be
+    generated first via scripts/analyze_tool_dependencies.py.
+
+    Parameters
+    ----------
+    queries_path : str
+        Path to the queries-and-answers CSV.
+    model_name : str
+        The agent model that executes the task.
+    planner_model : str
+        The model used to plan which tools to use (default: gpt-4o).
+    dependencies_path : str
+        Path to tool_dependencies.json (default: data/tool_dependencies.json).
+    num_retrys : int
+        Number of retries if the agent takes no actions.
+    """
+    OPENAI_KEY = open("openai_key.txt", "r").read().strip()
+    client = OpenAI(api_key=OPENAI_KEY)
+
+    dep_map = _load_dependency_map(dependencies_path)
+
+    queries_df = pd.read_csv(queries_path)
+    queries = queries_df["query"].tolist()
+
+    system_prompt = (
+        f"Today's date is {HARDCODED_CURRENT_TIME.strftime('%A')}, "
+        f"{HARDCODED_CURRENT_TIME.date()} and the current time is {HARDCODED_CURRENT_TIME.time()}. "
+        "Remember the current date and time when answering queries. "
+        "Meetings must not start before 9am or end after 6pm. "
+        "Use the available tools to complete the user's request. "
+        "When you have finished all necessary tool calls, provide a brief final answer."
+    )
+
+    results = pd.DataFrame(columns=["query", "function_calls", "full_response", "error"])
+
+    for i, query in enumerate(queries):
+        print(f"\n[{i + 1}/{len(queries)}] {query}")
+
+        # Plan tools for this specific query
+        tools = _plan_tools_for_query(client, planner_model, query, dep_map)
+
+        error = ""
+        function_calls = []
+        response_str = ""
+
+        try:
+            function_calls, response_str, error = _run_openai_agent(
+                client=client,
+                model_name=model_name,
+                query=query,
+                tools=tools,
+                system_prompt=system_prompt,
+            )
+
+            if len(function_calls) == 0:
+                for retry_num in range(num_retrys):
+                    print(f"No actions taken. Retry {retry_num + 1} of {num_retrys}")
+                    function_calls, response_str, error = _run_openai_agent(
+                        client=client,
+                        model_name=model_name,
+                        query=query,
+                        tools=tools,
+                        system_prompt=system_prompt,
+                    )
+                    if len(function_calls) > 0:
+                        break
+
+        except Exception as e:
+            context_window_error_messages = [
+                "maximum input length",
+                "maximum context length",
+                "prompt is too long",
+                "Request too large",
+                "context_length_exceeded",
+            ]
+            print(f"ERROR on query: {query}")
+            print(f"  Exception type : {type(e).__name__}")
+            print(f"  Exception detail: {e}")
+            if any(msg in str(e) for msg in context_window_error_messages):
+                error = "Context window exceeded"
+            else:
+                error = str(e)
+
+        print(f"### Query: {query}")
+        print(f"### Answer: {function_calls}")
+
+        results = pd.concat(
+            [
+                results,
+                pd.DataFrame(
+                    [[query, function_calls, response_str, error]],
+                    columns=["query", "function_calls", "full_response", "error"],
+                ),
+            ],
+            ignore_index=True,
+        )
+
+        for domain in DOMAINS:
+            domain.reset_state()
+
+    domain = queries_path.split("/")[-1].split(".")[0].replace("_queries_and_answers", "")
+    save_dir = os.path.join("data", "results", domain)
+    os.makedirs(save_dir, exist_ok=True)
+    current_datetime = str(pd.Timestamp.now()).split(".")[0].replace(" ", "_").replace(":", "-")
+    save_path = os.path.join(save_dir, model_name + "_planned_" + current_datetime + ".csv")
+    results.to_csv(save_path, index=False, quoting=csv.QUOTE_ALL)
+    return results
