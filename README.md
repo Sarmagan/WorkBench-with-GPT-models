@@ -89,3 +89,36 @@ The gpt-5-nano results are as follows:
 | `src/evals/utils.py` | Replaced `initialize_agent` + LangChain LLMs with `openai.OpenAI` + a hand-rolled tool-calling loop |
 | `scripts/inference/generate_results.py` | Removed LangChain warning suppression |
 | `pyproject.toml` | New file — minimal deps for `uv` |
+
+## Tool Selection Pipeline
+
+Giving the agent only the tools relevant to a task improves performance by reducing noise in the prompt and limiting the action space. Two scripts support this:
+
+**1. Analyze tool dependencies** — runs once to extract which tools are prerequisites for others (e.g. `calendar__search_events` must run before `calendar__delete_event` to obtain the `event_id`). Output is saved to `data/tool_dependencies.json`.
+```bash
+uv run python scripts/analyze_tool_dependencies.py
+```
+
+**2. Plan tools for a task** — given a task string, asks an LLM to select the relevant tools, then checks the selection against the dependency graph and adds any missing prerequisites.
+```bash
+uv run python scripts/plan_tools.py --task "Delete my first meeting on December 13"
+```
+
+Run step 1 once, then use step 2 at inference time to pass only the planned tools to the agent instead of the full toolkit.
+
+
+Example:
+
+Task: Move all of Dmitri's tasks that are in progress to in review
+
+LLM selected (2):
+  - project_management__search_tasks
+  - project_management__update_task
+
+Missing dependencies added (1):
+  + company_directory__find_email_address
+
+Final tool plan (3):
+  ✓ project_management__search_tasks
+  ✓ project_management__update_task
+  ✓ company_directory__find_email_address
